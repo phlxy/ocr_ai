@@ -1,15 +1,17 @@
 from PyQt6.QtWidgets import (
     QMainWindow, QApplication, QFileDialog, QMessageBox, QVBoxLayout,
-    QWidget, QMenu, QSplitter
+    QWidget, QMenu, QSplitter,QComboBox ,QToolBar
 )
 from PyQt6.QtGui import QAction, QPixmap
 from PyQt6.QtCore import QTimer, Qt
 from core.document_handler import DocumentHandler
 from core.autosave import AutoSaveManager
-from core.annotation import export_annotations, validate_annotations, export_layoutlm_format
+from core.annotation import export_annotations, validate_annotations
+from core.annotation import LayoutLMExporter
 from gui.annotation_canvas import AnnotationCanvas
 from gui.pdf_list_widget import PdfListWidget  # Widget สำหรับแสดง thumbnail ของ PDF
 from core.pdf_utils import pdf_to_pixmap_list  # ฟังก์ชันแปลง PDF เป็น QPixmap list
+from core.document_types import DOCUMENT_TYPES  # นำเข้าข้อมูลประเภทเอกสาร
 
 from concurrent.futures import ProcessPoolExecutor
 from core.annotation import validate_annotations as core_validate_annotations
@@ -22,12 +24,18 @@ class MainWindow(QMainWindow):
         self.currentFile = None
         # Flag สำหรับติดตามงานที่ยังไม่ได้บันทึก
         self.unsavedChanges = False
+
+        # เพิ่ม attribute สำหรับประเภทเอกสารและ Label
+        self.currentDocType = None
+        self.currentLabel = None
+        self.currentLabelColor = None  # หรือกำหนดเป็นค่าสีเริ่มต้น เช่น "#000000"
+
         self.document_handler = DocumentHandler()
         self.annotations = []  # เก็บ Annotation objects ของ core
         self.autosave_manager = AutoSaveManager()
         
         # สร้าง AnnotationCanvas สำหรับแสดงภาพเพื่อทำ annotation
-        self.canvas = AnnotationCanvas(self.annotations)
+        self.canvas = AnnotationCanvas(self.annotations, main_window=self)
         
         # QSplitter แบ่งพื้นที่เป็น 2 ส่วน (แนวนอน)
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -44,11 +52,14 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Zoom: 100%")
         
         self.create_menu()
-        
+        self.create_document_dropdowns()  # สร้าง dropdown สำหรับ Document Type และ Label
+
         self.executor = ProcessPoolExecutor()
         self.autosave_timer = QTimer(self)
         self.autosave_timer.timeout.connect(self.perform_auto_save)
         self.autosave_timer.start(300000)  # ทุก 5 นาที
+
+        
 
     def create_menu(self):
         menu_bar = self.menuBar()
@@ -64,7 +75,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(export_action)
         
         export_layoutlm_action = QAction("Export for LayoutLMv3", self)
-        export_layoutlm_action.triggered.connect(self.export_layoutlm_format)
+        export_layoutlm_action.triggered.connect(self.export_layoutlm)  # เปลี่ยนที่นี่
         file_menu.addAction(export_layoutlm_action)
         
         # Edit Menu (สำหรับ Undo)
@@ -88,6 +99,94 @@ class MainWindow(QMainWindow):
         validate_action = QAction("Validate Annotations", self)
         validate_action.triggered.connect(self.start_validation)
         tools_menu.addAction(validate_action)
+
+    def create_document_dropdowns(self):
+        """ สร้าง QToolBar พร้อม QComboBox สำหรับ Document Type และ Label """
+        toolbar = QToolBar("Document Options", self)
+        self.addToolBar(toolbar)
+
+        # QComboBox สำหรับ Document Type
+        self.combo_doc_type = QComboBox(self)
+        self.combo_doc_type.addItems(DOCUMENT_TYPES.keys())
+        self.combo_doc_type.currentIndexChanged.connect(self.on_doc_type_changed)
+        toolbar.addWidget(self.combo_doc_type)
+
+        # QComboBox สำหรับ Label
+        self.combo_label = QComboBox(self)
+        # อัปเดต label combo ตาม Document Type เริ่มต้น
+        if DOCUMENT_TYPES:
+            default_type = list(DOCUMENT_TYPES.keys())[0]
+            self.combo_label.addItems(list(DOCUMENT_TYPES[default_type].keys()))
+            # ตั้งค่าเริ่มต้นสำหรับ currentDocType, currentLabel, currentLabelColor
+            self.currentDocType = default_type
+            self.currentLabel = list(DOCUMENT_TYPES[default_type].keys())[0]
+            self.currentLabelColor = DOCUMENT_TYPES[default_type][self.currentLabel]
+        self.combo_label.currentIndexChanged.connect(self.on_label_changed)
+        toolbar.addWidget(self.combo_label)
+    
+    def on_doc_type_changed(self, index):
+        """ เมื่อเปลี่ยน Document Type ให้อัปเดต combo_label และ attribute """
+        doc_type = self.combo_doc_type.currentText()
+        self.currentDocType = doc_type
+        self.update_label_combo()
+
+    def update_label_combo(self):
+        """ อัปเดต QComboBox ของ Labels ตาม Document Type ที่เลือก """
+        self.combo_label.clear()
+        if self.currentDocType in DOCUMENT_TYPES:
+            labels = DOCUMENT_TYPES[self.currentDocType]
+            self.combo_label.addItems(list(labels.keys()))
+            # ตั้งค่าเริ่มต้นให้กับ Label และสี
+            if labels:
+                self.currentLabel = list(labels.keys())[0]
+                self.currentLabelColor = labels[self.currentLabel]
+                self.combo_label.setCurrentIndex(0)
+
+    def on_label_changed(self, index):
+        """ เมื่อเปลี่ยน Label ให้เก็บค่า Label และสี """
+        label = self.combo_label.currentText()
+        self.currentLabel = label
+        if self.currentDocType in DOCUMENT_TYPES:
+            self.currentLabelColor = DOCUMENT_TYPES[self.currentDocType].get(label, "#000000")
+        # อัปเดตสถานะใน Status Bar (ถ้าต้องการ)
+        self.statusBar().showMessage(f"Document Type: {self.currentDocType} | Label: {self.currentLabel} ({self.currentLabelColor}) - Zoom: {int(self.canvas._zoom_step ** self.canvas._zoom * 100)}%")
+
+
+    def create_document_type_menu(self):
+        """ สร้างเมนู Document Type และ Labels """
+        menu_bar = self.menuBar()
+        # สร้างเมนูสำหรับประเภทเอกสาร
+        self.doc_type_menu = QMenu("Document Type", self)
+        for doc_type in DOCUMENT_TYPES.keys():
+            action = QAction(doc_type, self)
+            action.triggered.connect(lambda checked, dt=doc_type: self.set_document_type(dt))
+            self.doc_type_menu.addAction(action)
+        menu_bar.addMenu(self.doc_type_menu)
+        # สร้างเมนูสำหรับ Labels (จะอัปเดตตามประเภทเอกสาร)
+        self.label_menu = QMenu("Labels", self)
+        menu_bar.addMenu(self.label_menu)
+
+    def set_document_type(self, doc_type):
+        """ ตั้งค่า current document type และอัปเดตเมนู Labels """
+        self.currentDocType = doc_type
+        self.update_label_menu()
+
+    def update_label_menu(self):
+        """ อัปเดตเมนู Labels จาก DOCUMENT_TYPES """
+        self.label_menu.clear()
+        labels = DOCUMENT_TYPES.get(self.currentDocType, {})
+        for label, color in labels.items():
+            action = QAction(label, self)
+            # เก็บค่าสีใน action.data
+            action.setData(color)
+            action.triggered.connect(lambda checked, l=label, c=color: self.set_current_label(l, c))
+            self.label_menu.addAction(action)
+
+    def set_current_label(self, label, color):
+        """ ตั้งค่า Label ที่เลือกและสีที่เกี่ยวข้อง """
+        self.currentLabel = label
+        self.currentLabelColor = color
+        self.statusBar().showMessage(f"Document Type: {self.currentDocType} | Label: {label} ({color}) - Zoom: {int(self.canvas._zoom_step ** self.canvas._zoom * 100)}%")
 
     def update_zoom_status(self):
         zoom_factor = self.canvas._zoom_step ** self.canvas._zoom
@@ -129,9 +228,30 @@ class MainWindow(QMainWindow):
         json_data = export_annotations(self.annotations)
         QMessageBox.information(self, "Exported JSON", json_data)
 
-    def export_layoutlm_format(self):
-        json_data = export_layoutlm_format(self.annotations)
-        QMessageBox.information(self, "Exported LayoutLM Format", json_data)
+    def export_layoutlm(self):
+        """Method สำหรับ Export ข้อมูลในรูปแบบ LayoutLMv3"""
+        export_directory = QFileDialog.getExistingDirectory(self, "Select Export Directory")
+        if not export_directory:
+            return  # หากไม่เลือก directory ให้ยกเลิก
+
+        # ตรวจสอบ attribute ที่จำเป็น (คุณต้องแน่ใจว่า current_document, file_annotations, doc_type_combo, original_pixmap ถูกเซ็ตไว้แล้ว)
+        if not (hasattr(self, 'current_document') and hasattr(self, 'file_annotations')):
+            QMessageBox.critical(self, "Error", "Document data is not available for export.")
+            return
+
+        from core.annotation import LayoutLMExporter  # นำเข้าคลาส LayoutLMExporter
+        exporter = LayoutLMExporter(
+            current_document=self.current_document,
+            file_annotations=self.file_annotations,
+            doc_type_combo=self.doc_type_combo,
+            original_pixmap=self.original_pixmap
+        )
+        try:
+            exporter.export_layoutlm_format(export_directory)
+            QMessageBox.information(self, "Export", "Export for LayoutLMv3 completed.")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", str(e))
+
 
     def start_validation(self):
         future = self.executor.submit(core_validate_annotations, self.annotations)
